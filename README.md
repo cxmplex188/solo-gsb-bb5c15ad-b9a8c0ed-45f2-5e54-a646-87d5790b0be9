@@ -5,6 +5,7 @@
 - 创建屏障时指定**参与者名单**、**达标人数（quorum）**和**截止时间**；
 - 参与者以自己的标识**幂等报到**；
 - 并发报到中**首次达到达标人数的瞬间，达标成员在 Redis 内被原子冻结**为快照，之后的任何报到（哪怕来自其他名单成员）都不会改写 `quorum` 与 `frozen_at`；
+- 每次名单成员报到（**首次 / 重复 / 达标后迟到**）都在与状态变更**同一 Redis 原子操作**中写入一条带**递增序号**的审计事件，支持游标分页查询；
 - 提供**阻塞等待接口**：达标时立即返回冻结快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）。
 
 ## 一条命令启动（含 Redis）
@@ -82,7 +83,9 @@ curl -s -X POST http://localhost:8000/barriers/<id>/checkin \
 - `reached`：**本次报到使屏障达标**，`triggered=true`，`quorum` 为冻结成员快照；
 - `late`：屏障已达标后才报到，仅记入 `late`，**冻结快照不变**。
 
-非名单成员 → `403`；屏障不存在/已回收 → `404`；截止后报到 → `409`。
+以上四种结果各对应一条审计事件（报到响应额外回传该事件的 `seq`）。
+非名单成员 → `403`；屏障不存在/已回收 → `404`；截止后报到 → `409`；请求体非法 → `422`。
+**错误请求不会产生任何事件。**
 
 ### 3. 阻塞等待 `GET /barriers/{barrier_id}/wait`
 
@@ -98,10 +101,45 @@ curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标或截
 
 随时查看当前 `waiting / reached / expired` 状态、报到人数、冻结快照、缺席与迟到名单。
 
+### 5. 报到审计事件 `GET /barriers/{barrier_id}/events`
+
+```bash
+curl -s "http://localhost:8000/barriers/<id>/events?limit=50"
+```
+
+查询参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `limit` | `50` | 单页事件数，范围 `1–200`（越界 → `422`） |
+| `cursor` | 无 | 上一页返回的 `next_cursor`；首次请求省略，从序号 0 开始（无法解析 → `400`） |
+
+响应：
+
+```json
+{
+  "barrier_id": "8f3c…",
+  "limit": 50,
+  "events": [
+    {"seq": 0, "participant_id": "node-a", "result": "checked_in", "ts": "2026-09-21T03:21:02.034000Z"},
+    {"seq": 1, "participant_id": "node-a", "result": "already_checked_in", "ts": "…"},
+    {"seq": 2, "participant_id": "node-b", "result": "reached", "ts": "…"},
+    {"seq": 3, "participant_id": "node-c", "result": "late", "ts": "…"}
+  ],
+  "next_cursor": null
+}
+```
+
+- 每个事件含 `seq`（从 0 起的递增序号）、`participant_id`、`result`（与报到状态同名）与 `ts`（UTC，Redis 内原子写入时刻）。
+- **分页协议**：取满 `limit` 条时返回不透明的 `next_cursor`；返回不足一整页（含 0 条）即到流末尾，`next_cursor` 为 `null`。
+- **跨并发稳定**：事件流只追加、下标永不移位。翻页期间发生并发报到，旧事件不会重复或消失，新事件只出现在后续页；需要长轮询等新事件时，反复用同一个 `next_cursor` 请求直到出现新事件即可。
+- 事件与屏障同生命周期：屏障回收（截止时间 + `BARRIER_TTL_BUFFER_MS`）前均可查询，回收后返回 `404`。
+
 ## 并发与一致性保证
 
-- 报到判定由一段 Lua 脚本完成：`名单校验 → 截止校验 → SADD → 人数判定 → 写入冻结快照` 整体原子执行。Redis 单线程串行执行脚本，因此并发报到**只有一个请求**得到 `reached`，冻结的成员集合与时间点唯一确定。
-- 冻结后脚本的所有写路径都不会触碰 `frozen` 键；迟到报到只追加到 `checked` 集合并反映在 `late` 字段。
+- 报到判定由一段 Lua 脚本完成：`名单校验 → 截止校验 → SADD → 人数判定 → 写入冻结快照 → 写入审计事件` 整体原子执行。Redis 单线程串行执行脚本，因此并发报到**只有一个请求**得到 `reached`，冻结的成员集合、时间点与事件序号都唯一确定。
+- 审计事件在同一脚本内以 `LLEN → RPUSH` 追加到 `barrier:{bid}:audit` 列表，序号即追加前列表长度；错误请求（屏障不存在 / 非名单成员 / 已截止）在任何写入之前返回，**不产生事件**。事件页基于稳定列表下标（base64url 游标）读取，并发追加下不重不漏。
+- 冻结后脚本的所有写路径都不会触碰 `frozen` 键；迟到报到只追加到 `checked` 集合与审计列表，并反映在 `late` 字段。
 - 报到响应里的发布（`PUBLISH reached`）在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态。
 - 截止不发布消息（无后台扫描进程），等待者在剩余截止时间上自然到期回读，避免引入额外调度组件。
 
@@ -120,8 +158,8 @@ REDIS_URL=redis://localhost:6379/0 uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py           FastAPI 路由与错误映射
-  barrier_store.py  Redis 键模型 + 原子报到 Lua 脚本 + Pub/Sub
-  service.py        状态机视图组装、阻塞等待
+  barrier_store.py  Redis 键模型 + 原子报到/审计 Lua 脚本 + Pub/Sub
+  service.py        状态机视图组装、事件游标分页、阻塞等待
   models.py         请求/响应模型与校验
   config.py         环境变量配置
 Dockerfile          API 镜像

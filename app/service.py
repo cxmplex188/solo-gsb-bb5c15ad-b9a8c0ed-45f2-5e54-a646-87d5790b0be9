@@ -1,12 +1,47 @@
-"""屏障视图组装与阻塞等待逻辑。"""
+"""屏障视图组装、事件分页与阻塞等待逻辑。"""
 
 from __future__ import annotations
 
+import base64
+import binascii
 import time
 from datetime import datetime, timezone
 
 from .barrier_store import BarrierMeta, BarrierStore
-from .models import BarrierView
+from .models import BarrierView, CheckinEvent, EventPage
+
+# 游标负载前缀：拒绝格式不符或来自其他版本的游标。
+_CURSOR_PREFIX = "b1:"
+DEFAULT_EVENTS_LIMIT = 50
+MAX_EVENTS_LIMIT = 200
+
+
+class InvalidCursor(ValueError):
+    """分页游标无法解析。"""
+
+
+def encode_cursor(offset: int) -> str:
+    raw = f"{_CURSOR_PREFIX}{offset}".encode("ascii")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def decode_cursor(cursor: str) -> int:
+    """解码事件分页游标；任何损坏 / 越界输入抛 InvalidCursor。"""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        text = raw.decode("ascii")
+    except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        raise InvalidCursor(cursor) from exc
+    if not text.startswith(_CURSOR_PREFIX):
+        raise InvalidCursor(cursor)
+    try:
+        offset = int(text[len(_CURSOR_PREFIX) :])
+    except ValueError as exc:
+        raise InvalidCursor(cursor) from exc
+    if offset < 0:
+        raise InvalidCursor(cursor)
+    return offset
 
 
 def _dt(ts: float) -> datetime:
@@ -130,3 +165,35 @@ async def wait_for_settle(
             await pubsub.unsubscribe(store.channel(meta.barrier_id))
         finally:
             await pubsub.aclose()
+
+
+async def build_event_page(
+    store: BarrierStore,
+    meta: BarrierMeta,
+    offset: int,
+    limit: int,
+) -> EventPage:
+    """读取审计事件页并计算 next_cursor。
+
+    审计流是只追加的列表，offset 是稳定下标。满页（取到 limit 条）才返回
+    next_cursor，指向其后第一个下标；短页（含空页）即流末尾，返回 null。
+    并发新报到只会在尾部追加：旧下标永不移位，客户端稍后复用同一个
+    next_cursor 轮询即可拿到新事件，全程不重不漏。
+    """
+    events_raw = await store.list_events(meta.barrier_id, offset=offset, limit=limit)
+    events = [
+        CheckinEvent(
+            seq=ev["seq"],
+            participant_id=ev["participant_id"],
+            result=ev["result"],
+            ts=_dt(ev["ts"]),
+        )
+        for ev in events_raw
+    ]
+    next_cursor = encode_cursor(offset + len(events)) if len(events) == limit else None
+    return EventPage(
+        barrier_id=meta.barrier_id,
+        events=events,
+        next_cursor=next_cursor,
+        limit=limit,
+    )

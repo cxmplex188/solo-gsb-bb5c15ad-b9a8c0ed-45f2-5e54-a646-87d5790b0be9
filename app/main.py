@@ -3,8 +3,9 @@
 路由：
   POST   /barriers                 创建屏障（参与者名单、达标人数、截止时间）
   GET    /barriers/{bid}           查询当前状态（不阻塞）
-  POST   /barriers/{bid}/checkin   参与者幂等报到
+  POST   /barriers/{bid}/checkin   参与者幂等报到（原子写入审计事件）
   GET    /barriers/{bid}/wait      阻塞等待达标 / 截止
+  GET    /barriers/{bid}/events    分页查询报到审计事件
 
 交互文档：GET /docs（Swagger UI）
 """
@@ -14,7 +15,7 @@ from __future__ import annotations
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -31,8 +32,18 @@ from .models import (
     CheckinRequest,
     CheckinResponse,
     CreateBarrierRequest,
+    EventPage,
 )
-from .service import _dt, build_view, wait_for_settle
+from .service import (
+    DEFAULT_EVENTS_LIMIT,
+    MAX_EVENTS_LIMIT,
+    InvalidCursor,
+    _dt,
+    build_event_page,
+    build_view,
+    decode_cursor,
+    wait_for_settle,
+)
 
 settings = load_settings()
 
@@ -47,8 +58,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="任务收尾屏障 API",
-    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标或截止。",
-    version="1.0.0",
+    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待、报到审计。",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -75,6 +86,7 @@ async def root() -> dict[str, object]:
             "get": "GET /barriers/{barrier_id}",
             "checkin": "POST /barriers/{barrier_id}/checkin",
             "wait": "GET /barriers/{barrier_id}/wait",
+            "events": "GET /barriers/{barrier_id}/events",
         },
     }
 
@@ -162,8 +174,44 @@ async def checkin(
         triggered=result.triggered,
         quorum=result.quorum,
         frozen_at=_dt(result.frozen_at) if result.frozen_at is not None else None,
+        seq=result.seq,
         view=view,
     )
+
+
+@app.get(
+    "/barriers/{barrier_id}/events",
+    response_model=EventPage,
+    tags=["barriers"],
+)
+async def list_events(
+    barrier_id: str,
+    request: Request,
+    cursor: str | None = Query(
+        default=None,
+        description="上一页返回的 next_cursor；首次请求省略（从序号 0 开始）",
+    ),
+    limit: int = Query(
+        default=DEFAULT_EVENTS_LIMIT,
+        ge=1,
+        le=MAX_EVENTS_LIMIT,
+        description="单页事件数（1–200，默认 50）",
+    ),
+) -> EventPage:
+    """分页查询报到审计事件。
+
+    事件在报到 Lua 脚本中与状态变更同一原子操作写入，序号从 0 起严格递增。
+    游标为不透明字符串，基于事件流的稳定下标：跨并发报到翻页不重不漏，
+    可反复用同一 next_cursor 轮询等待新事件（新报到只会出现在后续页）。
+    屏障回收（TTL 到期）后与其他数据一并失效，返回 404。
+    """
+    try:
+        offset = decode_cursor(cursor) if cursor is not None else 0
+    except InvalidCursor:
+        raise HTTPException(status_code=400, detail="cursor 无法解析")
+
+    meta = await _load_meta(request, barrier_id)
+    return await build_event_page(store(request), meta, offset=offset, limit=limit)
 
 
 @app.get("/barriers/{barrier_id}/wait", response_model=BarrierView, tags=["barriers"])

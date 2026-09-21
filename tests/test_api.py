@@ -242,3 +242,232 @@ async def test_waiter_joining_after_reach_gets_snapshot():
         r = await c.get(f"/barriers/{bid}/wait")
         assert r.json()["status"] == "reached"
         assert r.json()["quorum"] == ["p"]
+
+
+async def get_events(client: AsyncClient, bid: str, **params):
+    return await client.get(f"/barriers/{bid}/events", params=params)
+
+
+@pytest.mark.asyncio
+async def test_checkin_writes_ordered_audit_events():
+    """首次 / 达标前重复 / 触发达标 / 达标后迟到，每次报到都有一条事件，
+    序号从 0 连续递增，时间为数字时间戳格式的 ISO 字符串。"""
+    from datetime import datetime
+
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+
+        cases = [
+            ("a", "checked_in"),
+            ("a", "already_checked_in"),
+            ("b", "reached"),
+            ("c", "late"),
+            ("c", "late"),
+        ]
+        for i, (pid, expected_status) in enumerate(cases):
+            r = await checkin(c, bid, pid)
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["status"] == expected_status
+            assert body["seq"] == i  # 报到响应直接回传本次事件序号
+
+        page = await get_events(c, bid, limit=50)
+        assert page.status_code == 200, page.text
+        data = page.json()
+        assert data["barrier_id"] == bid
+        assert data["limit"] == 50
+        events = data["events"]
+        assert [(e["seq"], e["participant_id"], e["result"]) for e in events] == [
+            (0, "a", "checked_in"),
+            (1, "a", "already_checked_in"),
+            (2, "b", "reached"),
+            (3, "c", "late"),
+            (4, "c", "late"),
+        ]
+        assert data["next_cursor"] is None  # 一页取完 -> 流末尾
+        # 时间字段可解析为带时区的 ISO-8601，且单调不减
+        tss = [datetime.fromisoformat(e["ts"]) for e in events]
+        assert all(t.tzinfo is not None for t in tss)
+        assert tss == sorted(tss)
+
+
+@pytest.mark.asyncio
+async def test_error_requests_write_no_events():
+    """403/409/404/422 等错误请求都不得产生审计事件。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=1)
+        bid = b["barrier_id"]
+
+        assert (await checkin(c, bid, "stranger")).status_code == 403
+        assert (await checkin(c, bid, "")).status_code == 422  # pydantic 校验
+        assert (await checkin(c, "deadbeefdeadbeef", "a")).status_code == 404
+        assert (await get_events(c, "deadbeefdeadbeef")).status_code == 404
+
+        # 等截止后再报到 -> 409
+        await asyncio.sleep(1.1)
+        assert (await checkin(c, bid, "a")).status_code == 409
+
+        page = await get_events(c, bid)
+        assert page.json()["events"] == []
+        assert page.json()["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_events_cursor_pagination_no_dup_no_gap():
+    """limit 分页 + cursor 串起所有页：序号连续、不重不漏。"""
+    async with await _client() as c:
+        members = [f"p{i}" for i in range(7)]
+        b = await create_barrier(c, members, threshold=7, ttl_s=10)
+        bid = b["barrier_id"]
+        for m in members:
+            await checkin(c, bid, m)
+
+        seen: list[int] = []
+        cursor = None
+        pages = 0
+        for _ in range(10):
+            params = {"limit": 3}
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = await get_events(c, bid, **params)
+            assert page.status_code == 200, page.text
+            body = page.json()
+            seqs = [e["seq"] for e in body["events"]]
+            seen.extend(seqs)
+            pages += 1
+            cursor = body["next_cursor"]
+            if cursor is None:
+                break
+
+        assert pages == 3  # 3 + 3 + 1
+        assert seen == list(range(7))
+
+        # 末尾游标再轮询：空页 + null，不报错
+        # 倒数第二页 next_cursor 指向最后一条，应仍能取到
+        tail = await get_events(c, bid, cursor=encode_test_cursor(6), limit=10)
+        assert [e["seq"] for e in tail.json()["events"]] == [6]
+        end = await get_events(c, bid, cursor=encode_test_cursor(7), limit=10)
+        assert end.json()["events"] == []
+        assert end.json()["next_cursor"] is None
+
+        # limit 越界 -> 422；坏游标 -> 400
+        assert (await get_events(c, bid, limit=0)).status_code == 422
+        assert (await get_events(c, bid, limit=201)).status_code == 422
+        assert (await get_events(c, bid, cursor="%%%not-base64")).status_code == 400
+        forged = _b64_cursor("b2:5")  # 版本前缀不符
+        assert (await get_events(c, bid, cursor=forged)).status_code == 400
+
+
+def _b64_cursor(payload: str) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(payload.encode()).rstrip(b"=").decode()
+
+
+def encode_test_cursor(offset: int) -> str:
+    return _b64_cursor(f"b1:{offset}")
+
+
+@pytest.mark.asyncio
+async def test_cursor_stable_across_concurrent_checkins():
+    """并发报到期间持续翻页：最终通过游标必定恰好收集到全部事件一次。"""
+    async with await _client() as c:
+        members = [f"c{i}" for i in range(20)]
+        b = await create_barrier(c, members, threshold=20, ttl_s=10)
+        bid = b["barrier_id"]
+
+        async def produce():
+            await asyncio.gather(
+                *(checkin(c, bid, m) for m in members)
+            )
+
+        async def drain():
+            collected: list[int] = []
+            cursor = None
+            for _ in range(500):
+                params = {"limit": 4}
+                if cursor is not None:
+                    params["cursor"] = cursor
+                body = (await get_events(c, bid, **params)).json()
+                seqs = [e["seq"] for e in body["events"]]
+                collected.extend(seqs)
+                cursor = body["next_cursor"]
+                if cursor is None:
+                    # 短页：此刻已读到流末尾
+                    if produce_task.done() and len(collected) == 20:
+                        return collected
+                    await asyncio.sleep(0.01)  # 等待并发新事件，复用同一游标
+                else:
+                    await asyncio.sleep(0)  # 让出，制造交错
+            return collected
+
+        produce_task = asyncio.create_task(produce())
+        collected = await drain()
+        await produce_task
+
+        assert sorted(collected) == list(range(20))
+        assert len(collected) == len(set(collected)) == 20  # 不重不漏
+
+        # threshold=20：前 19 条 checked_in，最后 1 条 reached
+        page = await get_events(c, bid, limit=50)
+        results = {(e["participant_id"], e["result"]) for e in page.json()["events"]}
+        assert len(results) == 20
+        reached_participants = {
+            e["participant_id"] for e in page.json()["events"]
+            if e["result"] == "reached"
+        }
+        assert len(reached_participants) == 1
+        assert all(
+            r in ("checked_in", "reached") for _, r in results
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_checkin_events_exactly_one_reached():
+    """并发达标的审计流：恰好一个 reached，序号连续，且每人有事件。"""
+    async with await _client() as c:
+        members = [f"e{i}" for i in range(6)]
+        b = await create_barrier(c, members, threshold=4, ttl_s=10)
+        bid = b["barrier_id"]
+
+        responses = await asyncio.gather(*(checkin(c, bid, m) for m in members))
+        seqs = [r.json()["seq"] for r in responses]
+        assert sorted(seqs) == list(range(6))  # 每个响应拿到唯一连续序号
+
+        page = await get_events(c, bid, limit=50)
+        events = page.json()["events"]
+        assert [e["seq"] for e in events] == list(range(6))
+        results = [e["result"] for e in events]
+        assert results.count("reached") == 1
+        assert sorted(p["participant_id"] for p in events) == sorted(members)
+        # reached 事件序号即视图中第 4 个报到（序号 3）
+        reached_events = [e for e in events if e["result"] == "reached"]
+        assert reached_events[0]["seq"] == 3
+
+
+@pytest.mark.asyncio
+async def test_events_share_barrier_lifecycle():
+    """审计键与屏障同生命周期：屏障在则事件在；屏障回收后事件同样 404。"""
+    from app.main import app as _app
+
+    redis = _app.state.store.redis
+
+    async with await _client() as c:
+        b = await create_barrier(c, ["t1", "t2"], threshold=2, ttl_s=2)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "t1")
+
+        assert (await get_events(c, bid)).status_code == 200
+        audit_ttl = await redis.pttl(f"barrier:{bid}:audit")
+        meta_ttl = await redis.pttl(f"barrier:{bid}")
+        # 报到脚本统一刷新全部键 TTL，两者同量级（差仅毫秒）
+        assert audit_ttl > 0 and meta_ttl > 0
+        assert abs(audit_ttl - meta_ttl) < 5000
+
+        # 模拟 Redis 回收：将该屏障所有键 TTL 压缩到 100ms
+        async for key in redis.scan_iter(match=f"barrier:{bid}*"):
+            await redis.pexpire(key, 100)
+        await asyncio.sleep(0.5)
+        assert (await c.get(f"/barriers/{bid}")).status_code == 404
+        assert (await get_events(c, bid)).status_code == 404

@@ -1,4 +1,4 @@
-"""Redis 持久层：屏障元数据、原子报到（Lua）、冻结快照与事件通知。
+"""Redis 持久层：屏障元数据、原子报到（Lua）、冻结快照、报到审计与事件通知。
 
 每个屏障使用如下键（``bid`` 为屏障 id）：
 
@@ -6,6 +6,7 @@
 ``barrier:{bid}:roster``   set   创建时声明的参与者名单
 ``barrier:{bid}:checked``  set   所有有效报到（含达标后的迟到报到）
 ``barrier:{bid}:frozen``   hash  达标冻结快照，仅在达标后存在（quorum/frozen_at）
+``barrier:{bid}:audit``    list  报到审计事件流（JSON），RPUSH 追加，下标即递增序号
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息。
 """
@@ -20,21 +21,27 @@ from typing import Any
 
 from redis.asyncio import Redis
 
-# 报到脚本。返回数组：{状态, 是否新加入(0/1), quorum JSON, frozen_at 字符串}
+# 报到脚本。返回数组：{状态, 是否新加入(0/1), quorum JSON, frozen_at 字符串, 事件序号}
 #
 # 状态取值：
-#   unknown             屏障不存在
-#   not_participant     报到者不在名单内
-#   expired             已过截止时间
+#   unknown             屏障不存在（不写审计）
+#   not_participant     报到者不在名单内（不写审计）
+#   expired             已过截止时间（不写审计）
 #   reached             本次报到使屏障达标，已原子写入冻结快照
 #   checked_in          报到成功，屏障仍在等待
 #   already_checked_in  幂等重复报到（未达标前）
 #   late                屏障达标后报到，快照不变
+#
+# 所有名单成员的有效报到（checked_in / already_checked_in / reached / late）
+# 都在本脚本内、与状态变更高下，RPUSH 一条审计事件；事件序号为追加前 LLEN，
+# Redis 单线程串行执行脚本，因此序号在并发报到下严格连续、不重不漏。
+# 错误请求（unknown / not_participant / expired）在任何写入之前返回，不产生事件。
 CHECKIN_SCRIPT = """
 local meta_key    = KEYS[1]
 local roster_key  = KEYS[2]
 local checked_key = KEYS[3]
 local frozen_key  = KEYS[4]
+local audit_key   = KEYS[5]
 local pid         = ARGV[1]
 local now         = tonumber(ARGV[2])
 
@@ -45,16 +52,26 @@ local function refresh_ttl()
         redis.call('PEXPIRE', roster_key, ttl_ms)
         redis.call('PEXPIRE', checked_key, ttl_ms)
         redis.call('PEXPIRE', frozen_key, ttl_ms)
+        redis.call('PEXPIRE', audit_key, ttl_ms)
     end
 end
 
+-- 在与状态变更同一脚本（同一原子操作）内追加有序审计事件，
+-- 序号取自追加前列表长度，天然随并发报到单调递增。
+local function record_event(result)
+    local seq = redis.call('LLEN', audit_key)
+    local event = cjson.encode({seq=seq, participant=pid, result=result, ts=now})
+    redis.call('RPUSH', audit_key, event)
+    return seq
+end
+
 if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
-    return {'unknown', '0', '', '0'}
+    return {'unknown', '0', '', '0', '-1'}
 end
 
 -- 名单校验优先于一切状态：非名单成员永远无法报到，也不能获得冻结快照。
 if redis.call('SISMEMBER', roster_key, pid) == 0 then
-    return {'not_participant', '0', '', '0'}
+    return {'not_participant', '0', '', '0', '-1'}
 end
 
 -- 达标冻结之后：冻结键已存在，任何后续报到都不得改写快照。
@@ -62,19 +79,19 @@ local quorum = redis.call('HGET', frozen_key, 'quorum')
 if quorum then
     -- 仅记录迟到事实，quorum/frozen_at 保持不变。
     redis.call('SADD', checked_key, pid)
+    local seq = record_event('late')
     refresh_ttl()
-    return {'late', '0', quorum, redis.call('HGET', frozen_key, 'frozen_at')}
+    return {'late', '0', quorum, redis.call('HGET', frozen_key, 'frozen_at'), tostring(seq)}
 end
 
 local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
 if now >= deadline then
-    return {'expired', '0', '', '0'}
+    return {'expired', '0', '', '0', '-1'}
 end
 
 local newly_added = redis.call('SADD', checked_key, pid)
 local count = redis.call('SCARD', checked_key)
 local threshold = tonumber(redis.call('HGET', meta_key, 'threshold'))
-refresh_ttl()
 
 -- 首次达到达标人数：在同一脚本内冻结成员名单，杜绝并发覆盖。
 if count >= threshold then
@@ -82,14 +99,18 @@ if count >= threshold then
     table.sort(members)
     local payload = cjson.encode(members)
     redis.call('HSET', frozen_key, 'quorum', payload, 'frozen_at', tostring(now))
+    local seq = record_event('reached')
     refresh_ttl()
-    return {'reached', tostring(newly_added), payload, tostring(now)}
+    return {'reached', tostring(newly_added), payload, tostring(now), tostring(seq)}
 end
 
-if newly_added == 1 then
-    return {'checked_in', '0', '', '0'}
+local result_name = 'checked_in'
+if newly_added ~= 1 then
+    result_name = 'already_checked_in'
 end
-return {'already_checked_in', '0', '', '0'}
+local seq = record_event(result_name)
+refresh_ttl()
+return {result_name, '0', '', '0', tostring(seq)}
 """
 
 
@@ -122,6 +143,7 @@ class CheckinResult:
     newly_added: bool
     quorum: list[str] | None
     frozen_at: float | None
+    seq: int | None  # 本次报到写入的审计事件序号；错误请求为 None
 
     @property
     def triggered(self) -> bool:
@@ -142,12 +164,17 @@ class BarrierStore:
     def channel(barrier_id: str) -> str:
         return f"barrier:{barrier_id}:events"
 
-    def _keys(self, barrier_id: str) -> tuple[str, str, str, str]:
+    @staticmethod
+    def audit_key(barrier_id: str) -> str:
+        return f"barrier:{barrier_id}:audit"
+
+    def _keys(self, barrier_id: str) -> tuple[str, str, str, str, str]:
         return (
             f"barrier:{barrier_id}",
             f"barrier:{barrier_id}:roster",
             f"barrier:{barrier_id}:checked",
             f"barrier:{barrier_id}:frozen",
+            self.audit_key(barrier_id),
         )
 
     async def create(
@@ -160,7 +187,7 @@ class BarrierStore:
         creator_id: str | None = None,
     ) -> BarrierMeta:
         barrier_id = uuid.uuid4().hex
-        meta_key, roster_key, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _ = self._keys(barrier_id)
         mapping: dict[str, Any] = {
             "threshold": threshold,
             "deadline": f"{deadline_ts:.3f}",
@@ -188,7 +215,7 @@ class BarrierStore:
         )
 
     async def get_meta(self, barrier_id: str) -> BarrierMeta | None:
-        meta_key, roster_key, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(meta_key)
         if not data:
             return None
@@ -204,12 +231,12 @@ class BarrierStore:
         )
 
     async def checkin(self, barrier_id: str, participant_id: str) -> CheckinResult:
-        """参与者幂等报到；达标判定与冻结在 Lua 中原子完成。"""
+        """参与者幂等报到；达标判定、冻结与审计事件写入在 Lua 中一次原子完成。"""
         keys = self._keys(barrier_id)
         raw = await self._checkin(
             keys=list(keys), args=[participant_id, f"{time.time():.3f}"]
         )
-        status, newly, quorum_json, frozen_at = raw
+        status, newly, quorum_json, frozen_at, seq = raw
 
         if status == "unknown":
             raise BarrierNotFound(barrier_id)
@@ -223,6 +250,7 @@ class BarrierStore:
             newly_added=newly == "1",
             quorum=json.loads(quorum_json) if quorum_json else None,
             frozen_at=float(frozen_at) if frozen_at not in ("", "0") else None,
+            seq=int(seq),
         )
 
         # 冻结发生在 Lua 内部；脚本返回后立刻发布唤醒事件。
@@ -232,8 +260,32 @@ class BarrierStore:
 
         return result
 
+    async def list_events(
+        self, barrier_id: str, offset: int = 0, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """按列表下标区间读取审计事件（不含屏障存在性校验，由调用方保证）。
+
+        事件只追加（RPUSH）、从不由中间插入或删除，因此基于下标的读取
+        在并发报到下保持稳定：旧下标指向的事件永不改变或移位。
+        """
+        raw = await self.redis.lrange(
+            self.audit_key(barrier_id), offset, offset + limit - 1
+        )
+        events: list[dict[str, Any]] = []
+        for item in raw:
+            ev = json.loads(item)
+            events.append(
+                {
+                    "seq": int(ev["seq"]),
+                    "participant_id": ev["participant"],
+                    "result": ev["result"],
+                    "ts": float(ev["ts"]),
+                }
+            )
+        return events
+
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:
-        _, _, _, frozen_key = self._keys(barrier_id)
+        _, _, _, frozen_key, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(frozen_key)
         if not data:
             return None
@@ -243,7 +295,7 @@ class BarrierStore:
         }
 
     async def checked_members(self, barrier_id: str) -> set[str]:
-        _, _, checked_key, _ = self._keys(barrier_id)
+        _, _, checked_key, _, _ = self._keys(barrier_id)
         return await self.redis.smembers(checked_key)
 
     async def ping(self) -> None:

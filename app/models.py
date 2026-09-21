@@ -82,4 +82,27 @@ class CheckinResponse(BaseModel):
     triggered: bool
     quorum: list[str] | None = None
     frozen_at: datetime | None = None
+    # 本次报到对应的审计事件序号（从 0 起递增）
+    seq: int | None = None
     view: BarrierView
+
+
+class CheckinEvent(BaseModel):
+    seq: int = Field(..., ge=0, description="事件序号，从 0 起随报到严格递增")
+    participant_id: str = Field(..., description="报到参与者标识")
+    result: str = Field(
+        ...,
+        description=(
+            "checked_in（首次报到）| already_checked_in（达标前重复报到）"
+            "| reached（本次触发达标）| late（达标后报到）"
+        ),
+    )
+    ts: datetime = Field(..., description="事件时间（UTC，Lua 原子写入时刻）")
+
+
+class EventPage(BaseModel):
+    barrier_id: str
+    events: list[CheckinEvent]
+    # 下一页游标；当前页为空（已读到事件流末尾）时为 null
+    next_cursor: str | None = None
+    limit: int
