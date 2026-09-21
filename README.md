@@ -98,9 +98,36 @@ curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标或截
 
 随时查看当前 `waiting / reached / expired` 状态、报到人数、冻结快照、缺席与迟到名单。
 
+### 5. 报到审计事件 `GET /barriers/{barrier_id}/events`
+
+```bash
+curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
+```
+
+每次名单成员报到（`checked_in` / `already_checked_in` / `reached` / `late`）都会在与状态变更**同一 Redis 原子操作**中追加一条有序事件；非名单成员、截止后报到等错误请求不产生事件。
+
+返回（节选）：
+
+```json
+{
+  "barrier_id": "8f3c…",
+  "events": [
+    {"seq": 1, "participant_id": "node-a", "result": "checked_in", "ts": "2026-09-20T14:59:50.123000Z"},
+    {"seq": 2, "participant_id": "node-b", "result": "reached", "ts": "2026-09-20T14:59:51.456000Z"}
+  ],
+  "next_cursor": 2
+}
+```
+
+- `cursor`：已读到的最大事件序号（`0` 表示从头开始）；`limit`：单页条数（1–1000，默认 100）；
+- 用上一页返回的 `next_cursor` 作为下一页的 `cursor` 即可顺序读完；无新事件时返回空页且 `next_cursor` 不变；
+- 事件只增不改、`seq` 连续递增，游标分页在并发报到下稳定、不重不漏；
+- 事件与屏障其他数据同生命周期：回收前可查询，回收后一并消失（`404`）。
+
 ## 并发与一致性保证
 
 - 报到判定由一段 Lua 脚本完成：`名单校验 → 截止校验 → SADD → 人数判定 → 写入冻结快照` 整体原子执行。Redis 单线程串行执行脚本，因此并发报到**只有一个请求**得到 `reached`，冻结的成员集合与时间点唯一确定。
+- 报到审计事件在同一 Lua 脚本内追加（`RPUSH` 到 `events` 列表，序号 = 列表长度 + 1），与状态变更同生共死：要么一起成功，要么都不发生；脚本串行执行保证 `seq` 从 1 连续递增、无空洞无重复。
 - 冻结后脚本的所有写路径都不会触碰 `frozen` 键；迟到报到只追加到 `checked` 集合并反映在 `late` 字段。
 - 报到响应里的发布（`PUBLISH reached`）在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态。
 - 截止不发布消息（无后台扫描进程），等待者在剩余截止时间上自然到期回读，避免引入额外调度组件。
@@ -120,7 +147,7 @@ REDIS_URL=redis://localhost:6379/0 uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py           FastAPI 路由与错误映射
-  barrier_store.py  Redis 键模型 + 原子报到 Lua 脚本 + Pub/Sub
+  barrier_store.py  Redis 键模型 + 原子报到 Lua 脚本（含审计事件）+ Pub/Sub
   service.py        状态机视图组装、阻塞等待
   models.py         请求/响应模型与校验
   config.py         环境变量配置

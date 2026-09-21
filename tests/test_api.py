@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -242,3 +243,133 @@ async def test_waiter_joining_after_reach_gets_snapshot():
         r = await c.get(f"/barriers/{bid}/wait")
         assert r.json()["status"] == "reached"
         assert r.json()["quorum"] == ["p"]
+
+
+async def get_events(client: AsyncClient, bid: str, cursor=0, limit=100):
+    return await client.get(
+        f"/barriers/{bid}/events", params={"cursor": cursor, "limit": limit}
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkin_events_recorded_in_order():
+    """首次、重复、达标、迟到四种报到各产生一条有序事件，字段齐全。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+
+        # 尚未报到时为空页
+        r = await get_events(c, bid)
+        assert r.status_code == 200
+        assert r.json() == {"barrier_id": bid, "events": [], "next_cursor": 0}
+
+        assert (await checkin(c, bid, "a")).json()["status"] == "checked_in"
+        assert (await checkin(c, bid, "a")).json()["status"] == "already_checked_in"
+        assert (await checkin(c, bid, "b")).json()["status"] == "reached"
+        assert (await checkin(c, bid, "c")).json()["status"] == "late"
+
+        body = (await get_events(c, bid)).json()
+        assert body["next_cursor"] == 4
+        events = body["events"]
+        assert [e["seq"] for e in events] == [1, 2, 3, 4]
+        assert [e["participant_id"] for e in events] == ["a", "a", "b", "c"]
+        assert [e["result"] for e in events] == [
+            "checked_in",
+            "already_checked_in",
+            "reached",
+            "late",
+        ]
+        for e in events:
+            ts = datetime.fromisoformat(e["ts"])
+            assert ts.tzinfo is not None  # 带时区的合法时间
+
+
+@pytest.mark.asyncio
+async def test_events_pagination_cursor_limit():
+    """cursor/limit 翻页不重不漏，读完后游标不再前进；非法参数 422。"""
+    async with await _client() as c:
+        members = [f"p{i}" for i in range(5)]
+        b = await create_barrier(c, members, threshold=5, ttl_s=10)
+        bid = b["barrier_id"]
+        for m in members:
+            await checkin(c, bid, m)
+
+        # 每页 2 条，翻页读完全部 5 条
+        seen, cursor = [], 0
+        for _ in range(3):
+            body = (await get_events(c, bid, cursor=cursor, limit=2)).json()
+            assert len(body["events"]) <= 2
+            seen.extend(body["events"])
+            cursor = body["next_cursor"]
+        assert [e["seq"] for e in seen] == [1, 2, 3, 4, 5]
+        assert [e["participant_id"] for e in seen] == members
+        assert cursor == 5
+
+        # 读完后为空页，游标保持不动
+        body = (await get_events(c, bid, cursor=cursor, limit=2)).json()
+        assert body["events"] == []
+        assert body["next_cursor"] == 5
+
+        # 从中间游标开始只取右侧事件
+        body = (await get_events(c, bid, cursor=3, limit=100)).json()
+        assert [e["seq"] for e in body["events"]] == [4, 5]
+
+        # 非法参数与不存在的屏障
+        assert (await get_events(c, bid, cursor=-1)).status_code == 422
+        assert (await get_events(c, bid, limit=0)).status_code == 422
+        assert (await get_events(c, "deadbeefdeadbeef")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_failed_checkins_produce_no_events():
+    """非名单成员（403）、截止后报到（409）、屏障不存在（404）都不产生事件。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=1)
+        bid = b["barrier_id"]
+
+        r = await checkin(c, bid, "outsider")
+        assert r.status_code == 403
+
+        await asyncio.sleep(1.2)  # 等到过截止时间
+        r = await checkin(c, bid, "a")
+        assert r.status_code == 409
+
+        r = await checkin(c, "deadbeefdeadbeef", "a")
+        assert r.status_code == 404
+
+        body = (await get_events(c, bid)).json()
+        assert body["events"] == []
+        assert body["next_cursor"] == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_checkins_events_no_gap_no_dup():
+    """并发报到：事件总数等于成功报到次数，seq 恰好为 1..N 连续不重不漏。"""
+    async with await _client() as c:
+        members = [f"m{i}" for i in range(8)]
+        b = await create_barrier(c, members, threshold=4, ttl_s=10)
+        bid = b["barrier_id"]
+
+        # 8 个成员首报 + 2 个并发重复报到，共 10 个并发请求
+        reqs = [checkin(c, bid, m) for m in members]
+        reqs += [checkin(c, bid, "m0"), checkin(c, bid, "m1")]
+        results = await asyncio.gather(*reqs)
+        assert all(r.status_code == 200 for r in results)
+
+        events = (await get_events(c, bid, limit=100)).json()["events"]
+        assert len(events) == 10
+        assert [e["seq"] for e in events] == list(range(1, 11))
+
+        # m0、m1 各出现两次（首报 + 重复），其余成员各一次
+        counts = Counter(e["participant_id"] for e in events)
+        assert counts["m0"] == 2 and counts["m1"] == 2
+        assert all(counts[f"m{i}"] == 1 for i in range(2, 8))
+
+        # 事件结果与报到响应状态一一对应（同一原子操作的产物）
+        assert {e["result"] for e in events} <= {
+            "checked_in",
+            "already_checked_in",
+            "reached",
+            "late",
+        }
+        assert sum(1 for e in events if e["result"] == "reached") == 1

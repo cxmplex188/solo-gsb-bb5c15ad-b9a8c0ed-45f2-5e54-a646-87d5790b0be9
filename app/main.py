@@ -5,6 +5,7 @@
   GET    /barriers/{bid}           查询当前状态（不阻塞）
   POST   /barriers/{bid}/checkin   参与者幂等报到
   GET    /barriers/{bid}/wait      阻塞等待达标 / 截止
+  GET    /barriers/{bid}/events    报到审计事件（cursor/limit 分页）
 
 交互文档：GET /docs（Swagger UI）
 """
@@ -14,7 +15,7 @@ from __future__ import annotations
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -27,7 +28,9 @@ from .barrier_store import (
 )
 from .config import load_settings
 from .models import (
+    BarrierEventsPage,
     BarrierView,
+    CheckinEvent,
     CheckinRequest,
     CheckinResponse,
     CreateBarrierRequest,
@@ -75,6 +78,7 @@ async def root() -> dict[str, object]:
             "get": "GET /barriers/{barrier_id}",
             "checkin": "POST /barriers/{barrier_id}/checkin",
             "wait": "GET /barriers/{barrier_id}/wait",
+            "events": "GET /barriers/{barrier_id}/events",
         },
     }
 
@@ -179,4 +183,42 @@ async def wait_barrier(barrier_id: str, request: Request) -> BarrierView:
         meta,
         poll_interval_s=settings.poll_interval_s,
         max_wait_s=settings.max_wait_s,
+    )
+
+
+@app.get(
+    "/barriers/{barrier_id}/events",
+    response_model=BarrierEventsPage,
+    tags=["barriers"],
+)
+async def list_events(
+    barrier_id: str,
+    request: Request,
+    cursor: int = Query(
+        default=0, ge=0, description="已读到的最大事件序号；0 表示从头开始"
+    ),
+    limit: int = Query(
+        default=100, ge=1, le=1000, description="单页最大事件数（1-1000）"
+    ),
+) -> BarrierEventsPage:
+    """查询报到审计事件（按 seq 升序，cursor/limit 分页）。
+
+    每次名单成员报到（首次、重复、达标、迟到）都会在与状态变更同一 Redis
+    原子操作中追加一条事件；非名单成员、截止后报到等错误请求不产生事件。
+    事件只增不改，游标分页在并发报到下稳定不重不漏；屏障回收后事件一并消失。
+    """
+    await _load_meta(request, barrier_id)
+    events, next_cursor = await store(request).list_events(barrier_id, cursor, limit)
+    return BarrierEventsPage(
+        barrier_id=barrier_id,
+        events=[
+            CheckinEvent(
+                seq=e["seq"],
+                participant_id=e["participant_id"],
+                result=e["result"],
+                ts=_dt(e["ts"]),
+            )
+            for e in events
+        ],
+        next_cursor=next_cursor,
     )

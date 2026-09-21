@@ -1,4 +1,4 @@
-"""Redis 持久层：屏障元数据、原子报到（Lua）、冻结快照与事件通知。
+"""Redis 持久层：屏障元数据、原子报到（Lua）、冻结快照、报到审计事件与事件通知。
 
 每个屏障使用如下键（``bid`` 为屏障 id）：
 
@@ -6,6 +6,7 @@
 ``barrier:{bid}:roster``   set   创建时声明的参与者名单
 ``barrier:{bid}:checked``  set   所有有效报到（含达标后的迟到报到）
 ``barrier:{bid}:frozen``   hash  达标冻结快照，仅在达标后存在（quorum/frozen_at）
+``barrier:{bid}:events``   list  报到审计事件（JSON，seq 从 1 递增，只追加）
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息。
 """
@@ -30,11 +31,15 @@ from redis.asyncio import Redis
 #   checked_in          报到成功，屏障仍在等待
 #   already_checked_in  幂等重复报到（未达标前）
 #   late                屏障达标后报到，快照不变
+#
+# 四种成功状态（reached/checked_in/already_checked_in/late）都会在同一脚本内
+# 向 events 列表追加一条审计事件（seq 递增）；错误路径不产生任何事件。
 CHECKIN_SCRIPT = """
 local meta_key    = KEYS[1]
 local roster_key  = KEYS[2]
 local checked_key = KEYS[3]
 local frozen_key  = KEYS[4]
+local events_key  = KEYS[5]
 local pid         = ARGV[1]
 local now         = tonumber(ARGV[2])
 
@@ -45,7 +50,19 @@ local function refresh_ttl()
         redis.call('PEXPIRE', roster_key, ttl_ms)
         redis.call('PEXPIRE', checked_key, ttl_ms)
         redis.call('PEXPIRE', frozen_key, ttl_ms)
+        redis.call('PEXPIRE', events_key, ttl_ms)
     end
+end
+
+-- 审计事件：与状态变更处于同一原子脚本，seq 自 1 递增（下标 = seq - 1）。
+local function record_event(result)
+    local seq = redis.call('LLEN', events_key) + 1
+    redis.call('RPUSH', events_key, cjson.encode({
+        seq = seq,
+        participant_id = pid,
+        result = result,
+        ts = now
+    }))
 end
 
 if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
@@ -62,6 +79,7 @@ local quorum = redis.call('HGET', frozen_key, 'quorum')
 if quorum then
     -- 仅记录迟到事实，quorum/frozen_at 保持不变。
     redis.call('SADD', checked_key, pid)
+    record_event('late')
     refresh_ttl()
     return {'late', '0', quorum, redis.call('HGET', frozen_key, 'frozen_at')}
 end
@@ -74,7 +92,6 @@ end
 local newly_added = redis.call('SADD', checked_key, pid)
 local count = redis.call('SCARD', checked_key)
 local threshold = tonumber(redis.call('HGET', meta_key, 'threshold'))
-refresh_ttl()
 
 -- 首次达到达标人数：在同一脚本内冻结成员名单，杜绝并发覆盖。
 if count >= threshold then
@@ -82,13 +99,18 @@ if count >= threshold then
     table.sort(members)
     local payload = cjson.encode(members)
     redis.call('HSET', frozen_key, 'quorum', payload, 'frozen_at', tostring(now))
+    record_event('reached')
     refresh_ttl()
     return {'reached', tostring(newly_added), payload, tostring(now)}
 end
 
 if newly_added == 1 then
+    record_event('checked_in')
+    refresh_ttl()
     return {'checked_in', '0', '', '0'}
 end
+record_event('already_checked_in')
+refresh_ttl()
 return {'already_checked_in', '0', '', '0'}
 """
 
@@ -142,12 +164,13 @@ class BarrierStore:
     def channel(barrier_id: str) -> str:
         return f"barrier:{barrier_id}:events"
 
-    def _keys(self, barrier_id: str) -> tuple[str, str, str, str]:
+    def _keys(self, barrier_id: str) -> tuple[str, str, str, str, str]:
         return (
             f"barrier:{barrier_id}",
             f"barrier:{barrier_id}:roster",
             f"barrier:{barrier_id}:checked",
             f"barrier:{barrier_id}:frozen",
+            f"barrier:{barrier_id}:events",
         )
 
     async def create(
@@ -160,7 +183,7 @@ class BarrierStore:
         creator_id: str | None = None,
     ) -> BarrierMeta:
         barrier_id = uuid.uuid4().hex
-        meta_key, roster_key, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _ = self._keys(barrier_id)
         mapping: dict[str, Any] = {
             "threshold": threshold,
             "deadline": f"{deadline_ts:.3f}",
@@ -188,7 +211,7 @@ class BarrierStore:
         )
 
     async def get_meta(self, barrier_id: str) -> BarrierMeta | None:
-        meta_key, roster_key, _, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(meta_key)
         if not data:
             return None
@@ -233,7 +256,7 @@ class BarrierStore:
         return result
 
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:
-        _, _, _, frozen_key = self._keys(barrier_id)
+        _, _, _, frozen_key, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(frozen_key)
         if not data:
             return None
@@ -243,8 +266,22 @@ class BarrierStore:
         }
 
     async def checked_members(self, barrier_id: str) -> set[str]:
-        _, _, checked_key, _ = self._keys(barrier_id)
+        _, _, checked_key, _, _ = self._keys(barrier_id)
         return await self.redis.smembers(checked_key)
+
+    async def list_events(
+        self, barrier_id: str, cursor: int, limit: int
+    ) -> tuple[list[dict[str, Any]], int]:
+        """按游标读取报到审计事件：返回 seq > cursor 的至多 limit 条及新游标。
+
+        事件只追加且 seq 与列表下标一一对应（下标 = seq - 1），并发报到
+        只会让游标右侧变长，已读区间稳定，因此游标分页不重不漏。
+        """
+        *_, events_key = self._keys(barrier_id)
+        raw = await self.redis.lrange(events_key, cursor, cursor + limit - 1)
+        events = [json.loads(item) for item in raw]
+        next_cursor = events[-1]["seq"] if events else cursor
+        return events, next_cursor
 
     async def ping(self) -> None:
         await self.redis.ping()

@@ -83,3 +83,20 @@ class CheckinResponse(BaseModel):
     quorum: list[str] | None = None
     frozen_at: datetime | None = None
     view: BarrierView
+
+
+class CheckinEvent(BaseModel):
+    seq: int = Field(description="事件序号，从 1 开始单调递增，只追加不回改")
+    participant_id: str = Field(description="报到的参与者标识")
+    result: str = Field(
+        description="checked_in | already_checked_in | reached | late"
+    )
+    ts: datetime = Field(description="事件发生时间（UTC）")
+
+
+class BarrierEventsPage(BaseModel):
+    barrier_id: str
+    events: list[CheckinEvent]
+    next_cursor: int = Field(
+        description="下一页游标（本页最大 seq）；以其为 cursor 继续查询，无新事件时与入参 cursor 相同"
+    )
